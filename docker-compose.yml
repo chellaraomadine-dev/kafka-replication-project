@@ -1,0 +1,131 @@
+networks:
+  kafka-net:
+    driver: bridge
+
+services:
+
+  # ----------------------------------------------------------
+  # Primary Kafka Cluster (KRaft mode, no ZooKeeper)
+  # ----------------------------------------------------------
+  primary-kafka:
+    image: apache/kafka:4.0.0
+    container_name: primary-kafka
+    hostname: primary-kafka
+    networks:
+      - kafka-net
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://primary-kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@primary-kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "primary-cluster-id-0001"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # Standby (DR) Kafka Cluster
+  # ----------------------------------------------------------
+  standby-kafka:
+    image: apache/kafka:4.0.0
+    container_name: standby-kafka
+    hostname: standby-kafka
+    networks:
+      - kafka-net
+    ports:
+      - "9093:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://standby-kafka:9092
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@standby-kafka:9093
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      CLUSTER_ID: "standby-cluster-id-0001"
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # Topic Initialiser
+  # Creates topics on both clusters before MirrorMaker starts.
+  # Uses /bin/sh instead of bash (apache/kafka image is Alpine-based)
+  # ----------------------------------------------------------
+  topic-init:
+    image: apache/kafka:4.0.0
+    container_name: topic-init
+    networks:
+      - kafka-net
+    depends_on:
+      primary-kafka:
+        condition: service_healthy
+      standby-kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        echo '[topic-init] Creating commit-log on primary...' &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server primary-kafka:9092 --create --if-not-exists --topic commit-log --partitions 1 --replication-factor 1 --config retention.ms=60000 &&
+        echo '[topic-init] Creating primary.commit-log on standby...' &&
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server standby-kafka:9092 --create --if-not-exists --topic primary.commit-log --partitions 1 --replication-factor 1 &&
+        echo '[topic-init] Topics created successfully.'
+    restart: "no"
+
+  # ----------------------------------------------------------
+  # Enhanced MirrorMaker 2 (custom image with fault tolerance)
+  # ----------------------------------------------------------
+  mirrormaker:
+    image: chellarao/enhanced-mirrormaker2:latest
+    container_name: mirrormaker
+    hostname: mirrormaker
+    networks:
+      - kafka-net
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./mm2.properties:/opt/kafka/config/mm2.properties:ro
+    command:
+      - /bin/sh
+      - -c
+      - |
+        echo '[mirrormaker] Starting Enhanced MirrorMaker 2...' &&
+        /opt/kafka/bin/connect-mirror-maker.sh /opt/kafka/config/mm2.properties
+    restart: unless-stopped
+
+  # ----------------------------------------------------------
+  # Commit Log Producer
+  # Usage: docker-compose run --rm producer --count 1000
+  # ----------------------------------------------------------
+  producer:
+    image: chellarao/commit-log-producer:latest
+    container_name: producer
+    networks:
+      - kafka-net
+    environment:
+      BOOTSTRAP_SERVERS: primary-kafka:9092
+    depends_on:
+      topic-init:
+        condition: service_completed_successfully
+    entrypoint: ["python", "producer.py", "--bootstrap-servers", "primary-kafka:9092", "--topic", "commit-log"]
+    profiles: ["tools"]
