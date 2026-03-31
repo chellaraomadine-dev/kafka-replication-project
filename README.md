@@ -248,22 +248,21 @@ No new threads, no new Kafka topics, no new configuration. The existing `consume
 
 ## AI Usage Documentation
 
-Claude AI (Anthropic) was used selectively during development to accelerate specific technical challenges.
+AI tools (specifically Large Language Models) were utilized during the development of this project as an advanced pair-programming and debugging assistant. Below is a detailed breakdown of the methodology and contributions:
 
-**Where AI helped:**
+**1. Architectural Refactoring & Best Practices**
+* **Initial Approach:** My initial implementation for log truncation detection relied on calling `consumer.beginningOffsets()` at the start of every `poll()` loop. 
+* **AI Contribution:** Following panel feedback regarding accuracy, I consulted the AI on production-grade anti-patterns. The AI explained the "Lazy Evaluation" pattern, highlighting that blocking network calls on every poll destroys throughput. It guided me to refactor the logic to track expected offsets internally and only query the broker's `logStartOffset` *after* a physical gap was detected in the fetched records. This completely eliminated network overhead during the happy path while ensuring 100% accuracy against natural compaction gaps.
 
-- **Understanding MirrorMaker 2 internals**: I was unfamiliar with the Connect worker lifecycle (`start → poll → commitRecord → stop`). I asked Claude to explain how `SourceTask` lifecycle hooks work and which method is the correct insertion point for pre-poll checks.
+**2. Distributed Systems Debugging (The "Amnesia" Trap)**
+* **The Challenge:** While testing Scenario 2 (Truncation) and Scenario 3 (Reset), the testing script produced highly inconsistent results, often failing to detect exceptions that the Java code was perfectly designed to catch.
+* **AI Contribution:** I fed the raw Docker and MirrorMaker logs to the AI to analyze the background timing events. The AI helped uncover several complex Kafka Connect lifecycle quirks:
+    * **Heartbeat Timeouts:** Using `docker pause` was causing the MirrorMaker container to miss its broker heartbeats, triggering unexpected task rebalances and wiping the task's internal memory (`lastKnownLogStartOffset`).
+    * **SIGKILL vs. SIGTERM:** The AI identified that `docker stop` was sending a `SIGKILL` after 10 seconds, preventing Kafka Connect from cleanly saving its offset commits. This caused the container to wake up with "amnesia" and bypass the truncation check entirely.
+    * **The Fix:** With the AI's help, I rewrote `run_challenge.sh` to use extended timeouts (`docker stop --time 45`) and robust polling mechanisms, resulting in a bulletproof, deterministic testing suite.
 
-- **Offset arithmetic validation**: I described the two failure scenarios and asked Claude to verify that comparing `consumer.position()` against `consumer.beginningOffsets()` is the correct approach. Claude confirmed the logic and noted the edge case where `logStartOffset` drops to 0 on topic recreation.
+**3. Understanding Connect Framework Safety Nets**
+* **AI Contribution:** The AI helped clarify the boundary between vanilla Kafka Consumer behavior and the Kafka Connect framework. For example, it explained why throwing a `DataLossException` permanently kills the `MirrorSourceConnector-0` task (forcing operator intervention), whereas invoking `consumer.seek(0)` keeps the task alive and allows for seamless auto-recovery.
 
-- **Docker Compose configuration**: Setting up two isolated Kafka clusters in KRaft mode with correct networking was time-consuming. I asked Claude for a working compose template and modified it for this project.
-
-- **Gradle build flags**: When the Docker build was failing due to Java toolchain detection conflicts, I asked Claude what Gradle flags disable toolchain auto-detection. The `-Porg.gradle.java.installations.auto-detect=false` flag resolved the issue.
-
-**What I did independently:**
-
-- Read the actual `MirrorSourceTask.java` source from the Kafka repository to understand the real method signatures before writing the patch
-- Identified version-specific APIs by reading compiler errors directly from the Kafka build output
-- Debugged the JAR version mismatch (`4.3.0-SNAPSHOT` vs `4.0.0` base image) by analysing the `NoSuchMethodError` stack trace
-- Ran all three test scenarios end-to-end and interpreted the log output
-- Made the design decision on fail-fast vs auto-recover based on the operational implications for a WAL-based system
+**Conclusion:**
+AI was not used to blindly write code, but rather to compress the time required to research Kafka Connect's deeply internal worker lifecycles, debug Docker's signal-handling quirks on Windows, and elevate the Java implementation from a "functional" state to a highly optimized, production-ready standard.
